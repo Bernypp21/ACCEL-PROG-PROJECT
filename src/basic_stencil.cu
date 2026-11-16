@@ -1,7 +1,6 @@
 
 
 #include <cuda_runtime.h>
-#include <stdio.h>
 
 #include "stencils.cuh"
 
