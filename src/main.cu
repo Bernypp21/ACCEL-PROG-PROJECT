@@ -1,253 +1,219 @@
-
-
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <cuda_runtime.h>
+#include "stencils.cuh"
 
-#include "stencils.cuh" // the stencils
-
-
-//header declaration
 int load_input(const char *filename, float *input, int N);
-int save_output(const char *filename, float *output, int N);
+int save_output(const char *filename, const float *output, int N);
+int verify_output(const float *input, const float *output, int N);
 
+// Report a CUDA error instead of silently continuing.
+#define CUDA_CHECK(call) do {                                      \
+    cudaError_t error = (call);                                    \
+    if (error != cudaSuccess) {                                    \
+        fprintf(stderr, "CUDA error: %s (%s:%d)\n",               \
+                cudaGetErrorString(error), __FILE__, __LINE__);    \
+        exit(EXIT_FAILURE);                                       \
+    }                                                             \
+} while (0)
 
-//macro for the error checking
-#define CUDA_CHECK(call) cuda_check(call, __FILE__, __LINE__)
-
-
-//error checking for cuda
-void cuda_check(cudaError_t err, const char* file, int line)
+// Keep all kernel choices in one place.
+void launch_stencil(int type, dim3 blocks, dim3 threads,
+                    float *d_in, float *d_out, int N)
 {
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), file, line);
-
-        exit(EXIT_FAILURE);
-    }
+    if (type == 1)
+        parallel_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
+    else if (type == 2)
+        shared_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
+    else
+        shared_halo_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
 }
 
-
-// main
 int main(int argc, char *argv[])
 {
-    //check if there are arguments
-    if (argc != 4)
+    // Example: ./stencil 512 data/words.txt 3 100
+    if (argc != 4 && argc != 5)
     {
-        printf("Usage: ./stencil <N> <input_file> <stencil_type>\n"
-               "<N>: the nubmer of inputs in a row (N x N) ex.(512 x 512) N = 512\n"
-               "<input_file>: the text file containing numbers 0-255\n"
-               "<stencil_type>: 1 = basic parallel stencil\n"
-               "\t\t2 = shared memory stencil\n"
-               "\t\t3 = register stencil\n");
+        printf("Usage: %s <N> <input_file> <type> [repeats]\n", argv[0]);
+        printf("Types: 1 = basic, 2 = shared starter, 3 = shared halo\n");
         return EXIT_FAILURE;
     }
 
-    int N = atoi(argv[1]);    // the size of the image
-    const char *input_file = argv[2]; //the image file for image rending
-    int stencil_type = atoi(argv[3]);
-
-    // check if N is atleast 3, this way the smallest would by 3 x 3
-    if (N <= 2)
+    int N = atoi(argv[1]);
+    int type = atoi(argv[3]);
+    int repeats = (argc == 5) ? atoi(argv[4]) : 1;
+    if (N < 3 || type < 1 || type > 3 || repeats < 1)
     {
-        printf("Image size must be greater than 2\n");
+        fprintf(stderr, "N >= 3, type = 1..3, repeats >= 1 required.\n");
         return EXIT_FAILURE;
     }
 
-    int total = N * N;
-    int bytes = total * sizeof(float);
+    size_t count = (size_t)N * N;
+    size_t bytes = count * sizeof(float);
 
-
-    //use malloc to set up the arrays
+    // Step 1: Read image pixels into CPU memory.
     float *h_in = (float *)malloc(bytes);
-    float *h_out = (float *)malloc(bytes);
-
-
-    //check for errors
+    float *h_out = (float *)calloc(count, sizeof(float));
     if (h_in == NULL || h_out == NULL)
     {
-        fprintf(stderr, "Host memory allocation failed\n");
-
+        fprintf(stderr, "Could not allocate CPU memory.\n");
         free(h_in);
         free(h_out);
-
         return EXIT_FAILURE;
     }
-
-
-    //load the image pixel values from <image>.txt files
-    if (!load_input(input_file, h_in, N))
+    if (!load_input(argv[2], h_in, N))
     {
         free(h_in);
         free(h_out);
-
         return EXIT_FAILURE;
     }
 
-
-    //set all values to 0 in the output
-    for (int i = 0; i < total; i++)
-    {
-        h_out[i] = 0;
-    }
-
-
-    float *d_in, *d_out;
-
-    //allocate memory on the gpu
-    CUDA_CHECK(cudaMalloc((void**)&d_in, bytes));
-    CUDA_CHECK(cudaMalloc((void**)&d_out, bytes));
-
-    //set the values to be the same from host and device
+    // Step 2: Allocate GPU memory and transfer the input.
+    float *d_in = NULL;
+    float *d_out = NULL;
+    CUDA_CHECK(cudaMalloc((void **)&d_in, bytes));
+    CUDA_CHECK(cudaMalloc((void **)&d_out, bytes));
     CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_out, h_out, bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_out, 0, bytes)); // Keep the image border at zero.
 
-    // set up the threads and block amount
-    dim3 threads(16, 16);
-    dim3 blocks((N + threads.x - 1) / threads.x, (N + threads.y -1) / threads.y);
+    dim3 threads(IN_TILE_DIM, IN_TILE_DIM);
+    int tile_size = (type == 2) ? OUT_TILE_DIM : IN_TILE_DIM;
+    dim3 blocks((N + tile_size - 1) / tile_size,
+                (N + tile_size - 1) / tile_size);
 
-
-    //######################################################################
-    //          Edit this by adding your type of kernel
-    //  1 = basic kernel,   2 = shared kernel,  3 = register kernel
-    //launch the kernel
-    if (stencil_type == 1)
-        parallel_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
-    else
-        printf("\nNo kernel was launched\n");
-
-
-
-    //check for kernel launch errors
+    // Step 3: Warm up the GPU once before measuring time.
+    launch_stencil(type, blocks, threads, d_in, d_out, N);
     CUDA_CHECK(cudaGetLastError());
-
-    // make sure the code isn't continued untill all threads are done and check errors
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // copy the results back to host
+    // Step 4: Time only the GPU kernel (not file reading or writing).
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
+    for (int i = 0; i < repeats; i++)
+        launch_stencil(type, blocks, threads, d_in, d_out, N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float milliseconds = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+    printf("Average kernel time: %.5f ms (%d runs)\n",
+           milliseconds / repeats, repeats);
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Step 5: Copy output to CPU and check against a simple CPU result.
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    int correct = verify_output(h_in, h_out, N);
 
+    // Step 6: Save each kernel's result in its own folder.
+    const char *output_file = (type == 1)
+        ? "result/basic_stencil/stencil_output.txt"
+        : (type == 2)
+            ? "result/shared_stencil/stencil_output.txt"
+            : "result/shared_halo_stencil/stencil_output.txt";
+    int saved = save_output(output_file, h_out, N);
 
-    //###########################################################################
-    //      Add else ifs for the other kernels, you just need to 
-    //      change the string in the first arguement.
-    // save the newly rendered image into the results folder
-    if (stencil_type == 1)
-    {
-        if (!save_output("result/basic_stencil/stencil_output.txt", h_out, N))
-        {
-            fprintf(stderr, "Failed to save stencil output\n");
-        }
-    }
-
-
-    
-    // let the user know that the program is over
-    printf("Basic parallel stencil completed!\n");
-
-
-    //free up memory
     CUDA_CHECK(cudaFree(d_in));
     CUDA_CHECK(cudaFree(d_out));
-
     free(h_in);
     free(h_out);
-    h_in = NULL;
-    h_out = NULL;
 
-
-    return 0;
+    return (correct && saved) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-
-
-
-// this function will use fscanf to load in the image txt to an array
+// Read a text image: width, height, then N*N pixel values.
 int load_input(const char *filename, float *input, int N)
 {
     FILE *file = fopen(filename, "r");
-
     if (file == NULL)
     {
-        fprintf(stderr, "Could not open input file: %s\n", filename);
+        fprintf(stderr, "Could not open input: %s\n", filename);
         return 0;
     }
 
-    //read the image dimenstion from the first line
     int width, height;
-
-    if (fscanf(file, "%d %d", &width, &height) != 2)
+    if (fscanf(file, "%d %d", &width, &height) != 2 ||
+        width != N || height != N)
     {
-        fprintf(stderr, "Could not read image dimensions\n");
+        fprintf(stderr, "Image size does not match N.\n");
         fclose(file);
         return 0;
     }
 
-    // make sure image dimensions match N
-    if (width != N || height != N)
-    {
-        fprintf(stderr,
-                "Image dimensions (%d x %d) do not match N (%d x %d)\n",
-                width, height, N, N);
-
-        fclose(file);
-        return 0;
-    }
-
-    // read pixel values into the input array
-    int total = N * N;
-
-    for (int i = 0; i < total; i++)
+    for (size_t i = 0; i < (size_t)N * N; i++)
     {
         if (fscanf(file, "%f", &input[i]) != 1)
         {
-            fprintf(stderr, "Error reading pixel value %d\n", i);
-
+            fprintf(stderr, "Invalid pixel at index %zu.\n", i);
             fclose(file);
             return 0;
         }
     }
 
     fclose(file);
-
-    printf("Successfully loaded image: %d x %d\n", width, height);
-
+    printf("Loaded %d x %d image.\n", N, N);
     return 1;
 }
 
+// Compare GPU output with the same five-point average computed on the CPU.
+int verify_output(const float *input, const float *output, int N)
+{
+    int errors = 0;
+    float max_error = 0.0f;
 
+    for (int row = 0; row < N; row++)
+    {
+        for (int col = 0; col < N; col++)
+        {
+            int idx = row * N + col;
+            float expected = 0.0f; // Basic kernel leaves border pixels at zero.
 
+            if (row > 0 && row < N - 1 && col > 0 && col < N - 1)
+                expected = 0.2f * (
+                    input[idx] + input[idx - 1] + input[idx + 1] +
+                    input[idx - N] + input[idx + N]);
 
-// this function is used to save the image bluring using stencil
-// computation
-int save_output(const char *filename, float *output, int N)
+            float difference = fabsf(output[idx] - expected);
+            if (difference > max_error)
+                max_error = difference;
+            if (difference > 0.001f)
+            {
+                if (errors < 3)
+                    printf("Mismatch at (%d, %d): GPU %.4f, CPU %.4f\n",
+                           row, col, output[idx], expected);
+                errors++;
+            }
+        }
+    }
+
+    printf("Correctness: %s (max error %.6f)\n",
+           errors == 0 ? "PASS" : "FAIL", max_error);
+    return errors == 0;
+}
+
+// Save the output in the original project's text format.
+int save_output(const char *filename, const float *output, int N)
 {
     FILE *file = fopen(filename, "w");
-
-    //check if file had issues
     if (file == NULL)
     {
-        fprintf(stderr, "Could not open input file: %s\n", filename);
+        fprintf(stderr, "Could not write output: %s\n", filename);
         return 0;
     }
 
-    // write into the file the image dimensions at the top
     fprintf(file, "%d %d\n", N, N);
-
-    // write the pixel values
-    int total = N * N;
-    for (int i = 0; i < total; i++)
+    for (size_t i = 0; i < (size_t)N * N; i++)
     {
         fprintf(file, "%.2f ", output[i]);
-
-        if ((i + 1) % N == 0)   // make a new line for each row
+        if ((i + 1) % N == 0)
             fprintf(file, "\n");
     }
 
     fclose(file);
-
-    printf("Output saved to %s\n", filename);
-
-    return 1;//successfuly saved file.
+    printf("Saved %s\n", filename);
+    return 1;
 }
-
