@@ -1,219 +1,161 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <cuda_runtime.h>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <sys/stat.h>
 #include "stencils.cuh"
 
-int load_input(const char *filename, float *input, int N);
-int save_output(const char *filename, const float *output, int N);
-int verify_output(const float *input, const float *output, int N);
-
-// Report a CUDA error instead of silently continuing.
 #define CUDA_CHECK(call) do {                                      \
-    cudaError_t error = (call);                                    \
-    if (error != cudaSuccess) {                                    \
-        fprintf(stderr, "CUDA error: %s (%s:%d)\n",               \
-                cudaGetErrorString(error), __FILE__, __LINE__);    \
+    cudaError_t err = (call);                                      \
+    if (err != cudaSuccess) {                                      \
+        fprintf(stderr, "CUDA error: %s\n", cudaGetErrorString(err)); \
         exit(EXIT_FAILURE);                                       \
     }                                                             \
 } while (0)
 
-// Keep all kernel choices in one place.
-void launch_stencil(int type, dim3 blocks, dim3 threads,
-                    float *d_in, float *d_out, int N)
+// Read a square image stored as: width height, followed by pixels.
+bool load_image(const char *path, std::vector<float> &pixels, int N)
 {
-    if (type == 1)
-        parallel_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
-    else if (type == 2)
-        shared_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
-    else
-        shared_halo_stencil_kernel<<<blocks, threads>>>(d_in, d_out, N);
-}
-
-int main(int argc, char *argv[])
-{
-    // Example: ./stencil 512 data/words.txt 3 100
-    if (argc != 4 && argc != 5)
-    {
-        printf("Usage: %s <N> <input_file> <type> [repeats]\n", argv[0]);
-        printf("Types: 1 = basic, 2 = shared starter, 3 = shared halo\n");
-        return EXIT_FAILURE;
-    }
-
-    int N = atoi(argv[1]);
-    int type = atoi(argv[3]);
-    int repeats = (argc == 5) ? atoi(argv[4]) : 1;
-    if (N < 3 || type < 1 || type > 3 || repeats < 1)
-    {
-        fprintf(stderr, "N >= 3, type = 1..3, repeats >= 1 required.\n");
-        return EXIT_FAILURE;
-    }
-
-    size_t count = (size_t)N * N;
-    size_t bytes = count * sizeof(float);
-
-    // Step 1: Read image pixels into CPU memory.
-    float *h_in = (float *)malloc(bytes);
-    float *h_out = (float *)calloc(count, sizeof(float));
-    if (h_in == NULL || h_out == NULL)
-    {
-        fprintf(stderr, "Could not allocate CPU memory.\n");
-        free(h_in);
-        free(h_out);
-        return EXIT_FAILURE;
-    }
-    if (!load_input(argv[2], h_in, N))
-    {
-        free(h_in);
-        free(h_out);
-        return EXIT_FAILURE;
-    }
-
-    // Step 2: Allocate GPU memory and transfer the input.
-    float *d_in = NULL;
-    float *d_out = NULL;
-    CUDA_CHECK(cudaMalloc((void **)&d_in, bytes));
-    CUDA_CHECK(cudaMalloc((void **)&d_out, bytes));
-    CUDA_CHECK(cudaMemcpy(d_in, h_in, bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_out, 0, bytes)); // Keep the image border at zero.
-
-    dim3 threads(IN_TILE_DIM, IN_TILE_DIM);
-    int tile_size = (type == 2) ? OUT_TILE_DIM : IN_TILE_DIM;
-    dim3 blocks((N + tile_size - 1) / tile_size,
-                (N + tile_size - 1) / tile_size);
-
-    // Step 3: Warm up the GPU once before measuring time.
-    launch_stencil(type, blocks, threads, d_in, d_out, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Step 4: Time only the GPU kernel (not file reading or writing).
-    cudaEvent_t start, stop;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start));
-    for (int i = 0; i < repeats; i++)
-        launch_stencil(type, blocks, threads, d_in, d_out, N);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventRecord(stop));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float milliseconds = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
-    printf("Average kernel time: %.5f ms (%d runs)\n",
-           milliseconds / repeats, repeats);
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-
-    // Step 5: Copy output to CPU and check against a simple CPU result.
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
-    int correct = verify_output(h_in, h_out, N);
-
-    // Step 6: Save each kernel's result in its own folder.
-    const char *output_file = (type == 1)
-        ? "result/basic_stencil/stencil_output.txt"
-        : (type == 2)
-            ? "result/shared_stencil/stencil_output.txt"
-            : "result/shared_halo_stencil/stencil_output.txt";
-    int saved = save_output(output_file, h_out, N);
-
-    CUDA_CHECK(cudaFree(d_in));
-    CUDA_CHECK(cudaFree(d_out));
-    free(h_in);
-    free(h_out);
-
-    return (correct && saved) ? EXIT_SUCCESS : EXIT_FAILURE;
-}
-
-// Read a text image: width, height, then N*N pixel values.
-int load_input(const char *filename, float *input, int N)
-{
-    FILE *file = fopen(filename, "r");
-    if (file == NULL)
-    {
-        fprintf(stderr, "Could not open input: %s\n", filename);
-        return 0;
-    }
-
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); return false; }
     int width, height;
-    if (fscanf(file, "%d %d", &width, &height) != 2 ||
-        width != N || height != N)
-    {
-        fprintf(stderr, "Image size does not match N.\n");
-        fclose(file);
-        return 0;
-    }
-
-    for (size_t i = 0; i < (size_t)N * N; i++)
-    {
-        if (fscanf(file, "%f", &input[i]) != 1)
-        {
-            fprintf(stderr, "Invalid pixel at index %zu.\n", i);
-            fclose(file);
-            return 0;
-        }
-    }
-
-    fclose(file);
-    printf("Loaded %d x %d image.\n", N, N);
-    return 1;
+    bool ok = fscanf(f, "%d %d", &width, &height) == 2 &&
+              width == N && height == N;
+    for (size_t i = 0; ok && i < pixels.size(); ++i)
+        ok = fscanf(f, "%f", &pixels[i]) == 1;
+    fclose(f);
+    if (!ok) fprintf(stderr, "Invalid image or dimensions: %s\n", path);
+    return ok;
 }
 
-// Compare GPU output with the same five-point average computed on the CPU.
-int verify_output(const float *input, const float *output, int N)
+// Compare GPU pixels with the same five-point average on the CPU.
+bool verify(const std::vector<float> &in, const std::vector<float> &out, int N)
 {
-    int errors = 0;
-    float max_error = 0.0f;
-
-    for (int row = 0; row < N; row++)
-    {
-        for (int col = 0; col < N; col++)
-        {
-            int idx = row * N + col;
-            float expected = 0.0f; // Basic kernel leaves border pixels at zero.
-
-            if (row > 0 && row < N - 1 && col > 0 && col < N - 1)
-                expected = 0.2f * (
-                    input[idx] + input[idx - 1] + input[idx + 1] +
-                    input[idx - N] + input[idx + N]);
-
-            float difference = fabsf(output[idx] - expected);
-            if (difference > max_error)
-                max_error = difference;
-            if (difference > 0.001f)
-            {
-                if (errors < 3)
-                    printf("Mismatch at (%d, %d): GPU %.4f, CPU %.4f\n",
-                           row, col, output[idx], expected);
-                errors++;
+    for (int row = 0; row < N; ++row)
+        for (int col = 0; col < N; ++col) {
+            int p = row * N + col;
+            float expected = 0.0f; // Keep image borders zero.
+            if (row > 0 && row < N-1 && col > 0 && col < N-1)
+                expected = 0.2f * (in[p] + in[p-1] + in[p+1] +
+                                   in[p-N] + in[p+N]);
+            if (!(std::fabs(out[p] - expected) <= 0.001f)) {
+                printf("Mismatch at row %d, col %d\n", row, col);
+                return false;
             }
         }
-    }
-
-    printf("Correctness: %s (max error %.6f)\n",
-           errors == 0 ? "PASS" : "FAIL", max_error);
-    return errors == 0;
+    return true;
 }
 
-// Save the output in the original project's text format.
-int save_output(const char *filename, const float *output, int N)
+bool save_image(const char *folder, const std::vector<float> &out, int N)
 {
-    FILE *file = fopen(filename, "w");
-    if (file == NULL)
-    {
-        fprintf(stderr, "Could not write output: %s\n", filename);
-        return 0;
+    mkdir("result", 0755);
+    mkdir(folder, 0755);
+    char path[160];
+    snprintf(path, sizeof(path), "%s/stencil_output.txt", folder);
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); return false; }
+    fprintf(f, "%d %d\n", N, N);
+    for (size_t i = 0; i < out.size(); ++i)
+        fprintf(f, "%.2f%c", out[i], (i + 1) % N ? ' ' : '\n');
+    fclose(f);
+    return true;
+}
+
+void launch(int type, dim3 grid, dim3 block, float *in, float *out, int N)
+{
+    if (type == 1) parallel_stencil_kernel<<<grid, block>>>(in, out, N);
+    if (type == 2) shared_stencil_kernel<<<grid, block>>>(in, out, N);
+    if (type == 3) shared_halo_stencil_kernel<<<grid, block>>>(in, out, N);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr, "Usage: %s N image.txt type [repeats]\n"
+                        "Types: 0=benchmark all, 1=basic, 2=shared, 3=shared halo\n", argv[0]);
+        return 1;
+    }
+    int N = atoi(argv[1]), type = atoi(argv[3]);
+    int repeats = argc == 5 ? atoi(argv[4]) : 100;
+    if (N < 3 || type < 0 || type > 3 || repeats < 1) {
+        fprintf(stderr, "Expected N>=3, type=0..3, repeats>=1.\n");
+        return 1;
     }
 
-    fprintf(file, "%d %d\n", N, N);
-    for (size_t i = 0; i < (size_t)N * N; i++)
-    {
-        fprintf(file, "%.2f ", output[i]);
-        if ((i + 1) % N == 0)
-            fprintf(file, "\n");
-    }
+    const char *names[] = {"", "Basic", "Shared", "SharedHalo"};
+    const char *folders[] = {"", "result/basic_stencil",
+                             "result/shared_stencil", "result/shared_halo_stencil"};
+    size_t count = (size_t)N * N, bytes = count * sizeof(float);
+    std::vector<float> input(count), output(count), baseline(count);
+    if (!load_image(argv[2], input, N)) return 1;
 
-    fclose(file);
-    printf("Saved %s\n", filename);
-    return 1;
+    float *d_in = nullptr, *d_out = nullptr;
+    CUDA_CHECK(cudaMalloc((void **)&d_in, bytes));
+    CUDA_CHECK(cudaMalloc((void **)&d_out, bytes));
+    CUDA_CHECK(cudaMemcpy(d_in, input.data(), bytes, cudaMemcpyHostToDevice));
+
+    float base_ms = 0.0f;
+    bool ok = true;
+    for (int t = type == 0 ? 1 : type; t <= (type == 0 ? 3 : type); ++t) {
+        // Type 2 outputs 14x14 pixels per block; other types output 16x16.
+        int step = t == 2 ? OUT_TILE_DIM : IN_TILE_DIM;
+        dim3 block(IN_TILE_DIM, IN_TILE_DIM);
+        dim3 grid((N + step - 1) / step, (N + step - 1) / step);
+        CUDA_CHECK(cudaMemset(d_out, 0, bytes));
+        launch(t, grid, block, d_in, d_out, N); // Warm up GPU.
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < repeats; ++i)
+            launch(t, grid, block, d_in, d_out, N);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        float total_ms;
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaEventDestroy(stop));
+        float ms = total_ms / repeats;
+
+        CUDA_CHECK(cudaMemcpy(output.data(), d_out, bytes, cudaMemcpyDeviceToHost));
+        bool correct = verify(input, output, N);
+        bool same = true;
+        if (t == 1) {
+            baseline = output;
+            base_ms = ms;
+        } else if (type == 0) {
+            for (size_t i = 0; i < count; ++i)
+                if (!(std::fabs(output[i] - baseline[i]) <= 0.001f)) {
+                    same = false;
+                    break;
+                }
+        }
+        bool saved = save_image(folders[t], output, N);
+        printf("%-10s Average kernel time: %.6f ms | CPU: %s | Baseline: %s\n",
+               names[t], ms, correct ? "PASS" : "FAIL", same ? "PASS" : "FAIL");
+        ok &= correct && same && saved;
+
+        // The benchmark writes a CSV; Makefile clears it before a new run.
+        if (type == 0) {
+            mkdir("result", 0755);
+            FILE *csv = fopen("result/benchmark.csv", "a+");
+            if (!csv) { perror("result/benchmark.csv"); ok = false; }
+            else {
+                fseek(csv, 0, SEEK_END);
+                if (ftell(csv) == 0)
+                    fprintf(csv, "image,size,kernel,average_ms,speedup_vs_basic,matches_basic\n");
+                fprintf(csv, "%s,%d,%s,%.6f,%.3f,%s\n", argv[2], N, names[t],
+                        ms, ms > 0.0f ? base_ms / ms : 0.0f, same ? "PASS" : "FAIL");
+                fclose(csv);
+            }
+        }
+        if (!ok) break;
+    }
+    CUDA_CHECK(cudaFree(d_in));
+    CUDA_CHECK(cudaFree(d_out));
+    return ok ? 0 : 1;
 }
